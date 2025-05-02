@@ -1,6 +1,6 @@
 import asyncio
 import socket
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, List
 from .socket_interfaces import IClientSession, ServerBase
 from .packet_callbacks import PacketProcessor
 from .packet_frame import PacketFrame, debug_print
@@ -10,13 +10,13 @@ from .tcp_protocol import TcpProtocol
 class TcpClientSession(IClientSession):
     """TCP接続のクライアントセッションを表すクラス"""
     
-    def __init__(self, writer: asyncio.StreamWriter, user_id: int, group_id: int, name: str = None):
+    def __init__(self, writer: asyncio.StreamWriter, session_id: int, user_id: int = 0, group_id: int = 0, name: str = None):
         self._writer = writer
-        self._user_id = user_id
+        self._session_id = session_id  # セッションID（接続ごとに一意）
+        self._user_id = user_id        # ユーザーID（同一ユーザーから複数接続可能）
         self._group_id = group_id
         self._name = name
         self._is_alive = True
-        self._session_id = user_id  # セッションIDを追加
         
     @property
     def group_id(self) -> int:
@@ -66,9 +66,10 @@ class TcpServer(ServerBase):
     
     def __init__(self):
         super().__init__()
-        self._sessions: Dict[int, TcpClientSession] = {}
+        self._sessions: Dict[int, TcpClientSession] = {}  # session_id -> TcpClientSession
+        self._user_sessions: Dict[int, List[int]] = {}    # user_id -> List[session_id]
         self._server = None
-        self._next_session_id = 1  # 新しいクライアントに割り当てるID
+        self._next_session_id = 1  # 新しいクライアントに割り当てるセッションID
         self._running = False
         self._processor = PacketProcessor(self)
         
@@ -101,10 +102,33 @@ class TcpServer(ServerBase):
         # サーバーの実行を開始
         async with self._server:
             await self._server.serve_forever()
+    
+    def _register_user_session(self, session_id: int, user_id: int) -> None:
+        """ユーザーとセッションの関連付けを登録する"""
+        if user_id not in self._user_sessions:
+            self._user_sessions[user_id] = []
+        
+        if session_id not in self._user_sessions[user_id]:
+            self._user_sessions[user_id].append(session_id)
+            debug_print(f"ユーザー {user_id} にセッション {session_id} を関連付けました")
+            
+    def _unregister_user_session(self, session_id: int, user_id: int) -> None:
+        """ユーザーとセッションの関連付けを解除する"""
+        if user_id in self._user_sessions and session_id in self._user_sessions[user_id]:
+            self._user_sessions[user_id].remove(session_id)
+            debug_print(f"ユーザー {user_id} からセッション {session_id} の関連付けを解除しました")
+            
+            # リストが空になったら辞書から削除
+            if not self._user_sessions[user_id]:
+                del self._user_sessions[user_id]
+                
+    def _get_user_sessions(self, user_id: int) -> List[int]:
+        """ユーザーIDに関連付けられたすべてのセッションIDのリストを取得する"""
+        return self._user_sessions.get(user_id, [])
             
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """
-        クライアント接続を処理する - C#仕様に合わせた実装
+        クライアント接続を処理する
         
         Args:
             reader: クライアントからの読み込みストリーム
@@ -116,17 +140,17 @@ class TcpServer(ServerBase):
         self._next_session_id += 1
         
         # 初期値ではグループIDとユーザーIDは0とする
-        session = TcpClientSession(writer, session_id, 0, f"Client-{session_id}")
+        session = TcpClientSession(writer, session_id, 0, 0, f"Client-{session_id}")
         self._sessions[session_id] = session
         
         self.raise_log_message(f"クライアント接続: {addr}, SessionID: {session_id}")
         
         try:
-            # 初期メッセージの送信
+            # 初期メッセージの送信 - セッションIDは含めない
             welcome_packet = PacketFrame.from_text(
-                f"ようこそ！あなたのセッションIDは {session_id} です。",
-                destination_user_id=session_id,
-                source_user_id=0  # サーバーからのメッセージ
+                f"ようこそ！サーバーに接続しました。",
+                destination_user_id=0,  # まだユーザーIDが不明なのでセッションIDで宛先指定しない
+                source_user_id=0        # サーバーからのメッセージ
             )
             await TcpProtocol.send_packet(writer, welcome_packet)
             
@@ -137,13 +161,39 @@ class TcpServer(ServerBase):
                 if packet is None:
                     break
                 
-                # C#実装に合わせて、クライアントのグループIDとユーザーIDを更新
-                session.group_id = packet.source_group_id
-                session.user_id = packet.source_user_id
+                # 接続要求メッセージの処理（CONNECT:user_id:group_id形式）
+                if packet.payload_type == 1:  # PlainText
+                    message = packet.payload.decode('utf-8', errors='ignore')
+                    if message.startswith("CONNECT:"):
+                        try:
+                            # メッセージからユーザーIDとグループIDを抽出
+                            parts = message.split(":")
+                            if len(parts) >= 3:
+                                user_id = int(parts[1])
+                                group_id = int(parts[2])
+                                
+                                # 旧ユーザーIDの関連付けを解除
+                                if session.user_id != 0:
+                                    self._unregister_user_session(session_id, session.user_id)
+                                
+                                # 新しいユーザーID・グループIDを設定
+                                session.user_id = user_id
+                                session.group_id = group_id
+                                
+                                # ユーザーIDとセッションIDの関連付けを登録
+                                self._register_user_session(session_id, user_id)
+                                
+                                debug_print(f"クライアント情報更新 - SessionID: {session_id}, UserID: {user_id}, GroupID: {group_id}")
+                        except (IndexError, ValueError) as e:
+                            debug_print(f"CONNECT メッセージ解析エラー: {e}")
                 
-                debug_print(f"セッション情報更新 - SessionID: {session_id}, UserID: {session.user_id}, GroupID: {session.group_id}")
+                # パケットの送信元情報を更新（現在のセッション情報を使用）
+                if packet.source_user_id == 0xFFFF or packet.source_user_id == 0:
+                    packet.source_user_id = session.user_id
+                if packet.source_group_id == 0:
+                    packet.source_group_id = session.group_id
                 
-                # 宛先に応じた処理 (C#実装に合わせる)
+                # 宛先に応じた処理
                 if packet.destination_user_id == 0:
                     # サーバー宛てのパケット処理
                     debug_print(f"サーバー宛てパケット処理")
@@ -182,6 +232,10 @@ class TcpServer(ServerBase):
             import traceback
             traceback.print_exc()
         finally:
+            # ユーザーとセッションの関連付けを解除
+            if session.user_id != 0:
+                self._unregister_user_session(session_id, session.user_id)
+            
             # クライアントとの接続を閉じる
             session.close()
             writer.close()
@@ -209,16 +263,22 @@ class TcpServer(ServerBase):
                 await self._send_packet_to_client(session, packet)
     
     async def _send_to_user(self, user_id: int, packet: PacketFrame) -> None:
-        """特定のユーザーIDを持つクライアントにパケットを送信"""
-        for session in self._sessions.values():
-            if session.user_id == user_id:
-                await self._send_packet_to_client(session, packet)
+        """特定のユーザーIDを持つすべてのクライアントにパケットを送信"""
+        # ユーザーIDに関連付けられたすべてのセッションを取得
+        session_ids = self._get_user_sessions(user_id)
+        
+        for session_id in session_ids:
+            if session_id in self._sessions:
+                await self._send_packet_to_client(self._sessions[session_id], packet)
     
     async def _send_to_user_and_group(self, user_id: int, group_id: int, packet: PacketFrame) -> None:
         """特定のユーザーIDとグループIDを持つクライアントにパケットを送信"""
-        for session in self._sessions.values():
-            if session.user_id == user_id and session.group_id == group_id:
-                await self._send_packet_to_client(session, packet)
+        # ユーザーIDに関連付けられたすべてのセッションを取得
+        session_ids = self._get_user_sessions(user_id)
+        
+        for session_id in session_ids:
+            if session_id in self._sessions and self._sessions[session_id].group_id == group_id:
+                await self._send_packet_to_client(self._sessions[session_id], packet)
             
     async def _send_packet_to_client(self, session: TcpClientSession, packet: PacketFrame) -> None:
         """
@@ -240,14 +300,14 @@ class TcpServer(ServerBase):
             
     async def send_data_async(self, packet_data: PacketFrame) -> None:
         """
-        すべてのクライアントまたは特定のクライアントにデータを送信する - C#仕様に合わせた実装
+        すべてのクライアントまたは特定のクライアントにデータを送信する
         
         Args:
             packet_data: 送信するパケット
         """
         debug_print(f"send_data_async - 宛先ユーザーID: {packet_data.destination_user_id}, 宛先グループID: {packet_data.destination_group_id}")
         
-        # C#実装と同様に宛先に応じた処理
+        # 宛先に応じた処理
         if packet_data.destination_user_id != 0 and packet_data.destination_user_id != 0xFFFF:
             # 特定のユーザーへの送信
             await self._send_to_user(packet_data.destination_user_id, packet_data)

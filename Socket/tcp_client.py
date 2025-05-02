@@ -71,7 +71,7 @@ class TcpClient(ClientBase):
             self.disconnect()
             
     async def _receive_loop(self) -> None:
-        """サーバーからデータを受信し続けるループ - C#仕様に合わせた実装"""
+        """サーバーからデータを受信し続けるループ"""
         try:
             while self.is_alive and self._reader is not None:
                 # 完全なパケットを待機
@@ -80,17 +80,11 @@ class TcpClient(ClientBase):
                     debug_print("パケットの読み込みに失敗しました")
                     break
                 
-                # セッションIDを更新（初期メッセージからの処理）
+                # セッションIDはクライアント側では特に処理不要
                 if packet.payload_type == 1:  # PlainText
                     message = packet.payload.decode('utf-8', errors='ignore')
-                    if message.startswith("ようこそ！あなたのセッションIDは "):
-                        try:
-                            # メッセージからセッションIDを抽出
-                            session_id_str = message.split("は ")[1].split(" ")[0]
-                            self._session_id = int(session_id_str)
-                            debug_print(f"サーバーから割り当てられたセッションID: {self._session_id}")
-                        except (IndexError, ValueError) as e:
-                            debug_print(f"セッションID解析エラー: {e}")
+                    if message.startswith("ようこそ！"):
+                        debug_print("サーバーからウェルカムメッセージを受信しました")
                 
                 # パケットを処理
                 self._processor.process_packet(packet, "Server")
@@ -123,7 +117,7 @@ class TcpClient(ClientBase):
     
     async def send_data_async(self, packet_data: PacketFrame) -> None:
         """
-        サーバーにデータを送信する - C#仕様に合わせた実装
+        サーバーにデータを送信する
         
         Args:
             packet_data: 送信するパケット
