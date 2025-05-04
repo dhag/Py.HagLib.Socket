@@ -1,3 +1,4 @@
+#Py.HagLib.Socket/Socket/tcp_protocol.py
 import asyncio
 import struct  # struct モジュールを追加
 from typing import Optional, Tuple

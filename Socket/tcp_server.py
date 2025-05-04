@@ -1,3 +1,4 @@
+#Py.HagLib.Socket/Socket/tcp_server.py
 import asyncio
 import socket
 from typing import Dict, Optional, Set, List
@@ -359,9 +360,8 @@ class TcpServer(ServerBase):
         self._running = False
         
         # 全クライアントとの接続を閉じる
-        sessions_copy = []
-        async with self._sessions_lock:
-            sessions_copy = list(self._sessions.values())
+        # ロックを使用せずにセッションリストのコピーを作成
+        sessions_copy = list(self._sessions.values())
             
         for session in sessions_copy:
             session.close()
@@ -369,3 +369,4 @@ class TcpServer(ServerBase):
         # サーバーを停止
         if self._server:
             self._server.close()
+
