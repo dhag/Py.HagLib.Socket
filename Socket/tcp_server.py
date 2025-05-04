@@ -72,6 +72,7 @@ class TcpServer(ServerBase):
         self._next_session_id = 1  # 新しいクライアントに割り当てるセッションID
         self._running = False
         self._processor = PacketProcessor(self)
+        self._sessions_lock = asyncio.Lock()  # セッション管理用のロック
         
     @property
     def sessions(self) -> Dict[int, IClientSession]:
@@ -103,28 +104,33 @@ class TcpServer(ServerBase):
         async with self._server:
             await self._server.serve_forever()
     
-    def _register_user_session(self, session_id: int, user_id: int) -> None:
+    async def _register_user_session(self, session_id: int, user_id: int) -> None:
         """ユーザーとセッションの関連付けを登録する"""
-        if user_id not in self._user_sessions:
-            self._user_sessions[user_id] = []
-        
-        if session_id not in self._user_sessions[user_id]:
-            self._user_sessions[user_id].append(session_id)
-            debug_print(f"ユーザー {user_id} にセッション {session_id} を関連付けました")
+        async with self._sessions_lock:
+            if user_id not in self._user_sessions:
+                self._user_sessions[user_id] = []
             
-    def _unregister_user_session(self, session_id: int, user_id: int) -> None:
+            if session_id not in self._user_sessions[user_id]:
+                self._user_sessions[user_id].append(session_id)
+                debug_print(f"ユーザー {user_id} にセッション {session_id} を関連付けました")
+            
+    async def _unregister_user_session(self, session_id: int, user_id: int) -> None:
         """ユーザーとセッションの関連付けを解除する"""
-        if user_id in self._user_sessions and session_id in self._user_sessions[user_id]:
-            self._user_sessions[user_id].remove(session_id)
-            debug_print(f"ユーザー {user_id} からセッション {session_id} の関連付けを解除しました")
-            
-            # リストが空になったら辞書から削除
-            if not self._user_sessions[user_id]:
-                del self._user_sessions[user_id]
+        async with self._sessions_lock:
+            if user_id in self._user_sessions and session_id in self._user_sessions[user_id]:
+                self._user_sessions[user_id].remove(session_id)
+                debug_print(f"ユーザー {user_id} からセッション {session_id} の関連付けを解除しました")
+                
+                # リストが空になったら辞書から削除
+                if not self._user_sessions[user_id]:
+                    del self._user_sessions[user_id]
+                    debug_print(f"ユーザー {user_id} のセッションリストが空になったため削除しました")
+                else:
+                    debug_print(f"ユーザー {user_id} にはまだ {len(self._user_sessions[user_id])} 個のセッションが残っています")
                 
     def _get_user_sessions(self, user_id: int) -> List[int]:
         """ユーザーIDに関連付けられたすべてのセッションIDのリストを取得する"""
-        return self._user_sessions.get(user_id, [])
+        return self._user_sessions.get(user_id, []).copy()  # コピーを返すことで安全性を向上
             
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """
@@ -141,7 +147,9 @@ class TcpServer(ServerBase):
         
         # 初期値ではグループIDとユーザーIDは0とする
         session = TcpClientSession(writer, session_id, 0, 0, f"Client-{session_id}")
-        self._sessions[session_id] = session
+        
+        async with self._sessions_lock:
+            self._sessions[session_id] = session
         
         self.raise_log_message(f"クライアント接続: {addr}, SessionID: {session_id}")
         
@@ -174,14 +182,14 @@ class TcpServer(ServerBase):
                                 
                                 # 旧ユーザーIDの関連付けを解除
                                 if session.user_id != 0:
-                                    self._unregister_user_session(session_id, session.user_id)
+                                    await self._unregister_user_session(session_id, session.user_id)
                                 
                                 # 新しいユーザーID・グループIDを設定
                                 session.user_id = user_id
                                 session.group_id = group_id
                                 
                                 # ユーザーIDとセッションIDの関連付けを登録
-                                self._register_user_session(session_id, user_id)
+                                await self._register_user_session(session_id, user_id)
                                 
                                 debug_print(f"クライアント情報更新 - SessionID: {session_id}, UserID: {user_id}, GroupID: {group_id}")
                         except (IndexError, ValueError) as e:
@@ -234,7 +242,7 @@ class TcpServer(ServerBase):
         finally:
             # ユーザーとセッションの関連付けを解除
             if session.user_id != 0:
-                self._unregister_user_session(session_id, session.user_id)
+                await self._unregister_user_session(session_id, session.user_id)
             
             # クライアントとの接続を閉じる
             session.close()
@@ -245,20 +253,29 @@ class TcpServer(ServerBase):
                 pass
             
             # セッションを削除
-            if session_id in self._sessions:
-                del self._sessions[session_id]
+            async with self._sessions_lock:
+                if session_id in self._sessions:
+                    del self._sessions[session_id]
                 
             self.raise_log_message(f"クライアント切断: {addr}, SessionID: {session_id}")
     
     async def _send_to_all_clients_except(self, exclude_session_id: int, packet: PacketFrame) -> None:
         """指定したセッションID以外のすべてのクライアントにパケットを送信"""
-        for session_id, session in self._sessions.items():
+        sessions_copy = []
+        async with self._sessions_lock:
+            sessions_copy = list(self._sessions.items())
+            
+        for session_id, session in sessions_copy:
             if session_id != exclude_session_id:
                 await self._send_packet_to_client(session, packet)
     
     async def _send_to_group(self, group_id: int, packet: PacketFrame) -> None:
         """特定のグループに属するクライアントにパケットを送信"""
-        for session in self._sessions.values():
+        sessions_copy = []
+        async with self._sessions_lock:
+            sessions_copy = list(self._sessions.values())
+            
+        for session in sessions_copy:
             if session.group_id == group_id:
                 await self._send_packet_to_client(session, packet)
     
@@ -268,8 +285,12 @@ class TcpServer(ServerBase):
         session_ids = self._get_user_sessions(user_id)
         
         for session_id in session_ids:
-            if session_id in self._sessions:
-                await self._send_packet_to_client(self._sessions[session_id], packet)
+            session = None
+            async with self._sessions_lock:
+                session = self._sessions.get(session_id)
+            
+            if session and session.is_alive:
+                await self._send_packet_to_client(session, packet)
     
     async def _send_to_user_and_group(self, user_id: int, group_id: int, packet: PacketFrame) -> None:
         """特定のユーザーIDとグループIDを持つクライアントにパケットを送信"""
@@ -277,8 +298,12 @@ class TcpServer(ServerBase):
         session_ids = self._get_user_sessions(user_id)
         
         for session_id in session_ids:
-            if session_id in self._sessions and self._sessions[session_id].group_id == group_id:
-                await self._send_packet_to_client(self._sessions[session_id], packet)
+            session = None
+            async with self._sessions_lock:
+                session = self._sessions.get(session_id)
+            
+            if session and session.group_id == group_id and session.is_alive:
+                await self._send_packet_to_client(session, packet)
             
     async def _send_packet_to_client(self, session: TcpClientSession, packet: PacketFrame) -> None:
         """
@@ -289,14 +314,17 @@ class TcpServer(ServerBase):
             packet: 送信するパケット
         """
         if not session.is_alive:
+            debug_print(f"セッション {session.session_id} は既に切断されています")
             return
             
         writer = session.get_writer()
         try:
             await TcpProtocol.send_packet(writer, packet)
+            debug_print(f"パケット送信成功: セッションID {session.session_id}")
         except Exception as e:
-            self.raise_log_message(f"パケット送信中にエラーが発生: {e}")
-            session.close()
+            self.raise_log_message(f"パケット送信中にエラーが発生: {e}, セッションID: {session.session_id}")
+            # エラーが発生してもセッションは即座には閉じない
+            # 次のパケット受信時に切断が検出される
             
     async def send_data_async(self, packet_data: PacketFrame) -> None:
         """
@@ -316,7 +344,11 @@ class TcpServer(ServerBase):
             await self._send_to_group(packet_data.destination_group_id, packet_data)
         else:
             # すべてのクライアントへの送信
-            for session in self._sessions.values():
+            sessions_copy = []
+            async with self._sessions_lock:
+                sessions_copy = list(self._sessions.values())
+                
+            for session in sessions_copy:
                 await self._send_packet_to_client(session, packet_data)
                 
     def stop(self) -> None:
@@ -327,7 +359,11 @@ class TcpServer(ServerBase):
         self._running = False
         
         # 全クライアントとの接続を閉じる
-        for session in list(self._sessions.values()):
+        sessions_copy = []
+        async with self._sessions_lock:
+            sessions_copy = list(self._sessions.values())
+            
+        for session in sessions_copy:
             session.close()
             
         # サーバーを停止
