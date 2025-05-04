@@ -12,9 +12,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 #from Socket.tcp_server import TcpServer
 #from Socket.tcp_client import TcpClient
 #from Socket.packet_frame import PacketFrame
-from .tcp_server import TcpServer
-from .tcp_client import TcpClient
-from .packet_frame import PacketFrame
+from HagLib.Socket.tcp_server import TcpServer
+from HagLib.Socket.tcp_client import TcpClient
+from HagLib.Socket.packet_frame import PacketFrame
 # ----------------------
 # テスト用ハンドラー
 # ----------------------
