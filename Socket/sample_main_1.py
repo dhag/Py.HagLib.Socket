@@ -9,10 +9,12 @@ import argparse
 # 以下はパッケージパスを調整する例です。実際の環境に合わせて変更してください
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from socket_lib.tcp_server import TcpServer
-from socket_lib.tcp_client import TcpClient
-from socket_lib.packet_frame import PacketFrame
-
+#from Socket.tcp_server import TcpServer
+#from Socket.tcp_client import TcpClient
+#from Socket.packet_frame import PacketFrame
+from tcp_server import TcpServer
+from tcp_client import TcpClient
+from packet_frame import PacketFrame
 # ----------------------
 # テスト用ハンドラー
 # ----------------------
